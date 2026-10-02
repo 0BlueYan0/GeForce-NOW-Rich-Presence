@@ -376,12 +376,16 @@ class PresenceManager(QObject):
                 # Intentar conectar cada 2 segundos por un máximo de 10 segundos (5 intentos)
                 max_retries = 5
                 retry_delay = 2.0
-                
+
                 for attempt in range(max_retries):
                     try:
                         self.rpc.connect()
                         self._connected_client_id = client_id
                         logger.info(f"✅ Conectado a Discord RPC con client_id={client_id}")
+                        self._is_connecting = False
+                        target_game = getattr(self, "forced_game", None) or getattr(self, "last_game", None)
+                        if target_game:
+                            QTimer.singleShot(0, lambda: self.update_presence(target_game))
                         return
                     except Exception as e:
                         err_str = str(e)
@@ -1314,8 +1318,10 @@ class PresenceManager(QObject):
                             continue
                     except Exception:
                         continue
-                    title = win32gui.GetWindowText(hwnd)
-                    break
+                    w_title = win32gui.GetWindowText(hwnd)
+                    if w_title and w_title.strip():
+                        title = w_title.strip()
+                        break
             
             elif IS_MACOS:
                 # Use AppleScript to get the window title of GeForce NOW.
@@ -1749,6 +1755,10 @@ class PresenceManager(QObject):
             self.emit_presence_status()
             return
 
+        # Ensure details has fallback so Discord Rich Presence always displays card content
+        if not details and not state:
+            details = self.texts.get("playing_on_gfn", "En GeForce NOW")
+
         presence_data = {
             "details": details,
             "state": state,
@@ -1767,7 +1777,9 @@ class PresenceManager(QObject):
 
         try:
             if self.rpc and not getattr(self, "_is_connecting", False) and getattr(self, "_connected_client_id", None) == client_id:
-                self.rpc.update(**{k: v for k, v in presence_data.items() if v})
+                clean_payload = {k: v for k, v in presence_data.items() if v}
+                self.rpc.update(**clean_payload)
+                logger.debug(f"✨ Presencia enviada a Discord RPC: {current_game.get('name')}")
         except Exception as e:
             msg = str(e).lower()
             logger.error(f"❌ Error actualizando Presence: {e}")

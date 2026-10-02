@@ -214,6 +214,15 @@ class ForceGameHandlerMixin(Base):
         # PERSISTENCE: Save the match to games_config_merged.json
         self.pm._apply_discord_match(name, match)
         
+        self.pm.forced_game = {
+            "name": name,
+            "client_id": cid,
+            "executable_path": exe
+        }
+        self.pm.last_game = dict(self.pm.forced_game)
+        self.pm.current_game_start_time = int(time.time())
+        logger.info(f"🎮 Juego forzado activado: {name} (id={cid})")
+
         if cid:
             try:
                 def reconnect_after_delay():
@@ -234,14 +243,6 @@ class ForceGameHandlerMixin(Base):
             except Exception as e:
                 logger.debug(f"No se pudo cerrar ejecutable previo: {e}")
             self.pm.launch_fake_executable(exe, name)
-
-        self.pm.forced_game = {
-            "name": name,
-            "client_id": cid,
-            "executable_path": exe
-        }
-        self.pm.last_game = dict(self.pm.forced_game)
-        logger.info(f"🎮 Juego forzado activado: {name} (id={cid})")
         
         self.showMessage("OK", f"{TEXTS.get('tray_forced_game', 'Forced game')}: {name}", QSystemTrayIcon.Information, 3000)
         self.update_menu()
