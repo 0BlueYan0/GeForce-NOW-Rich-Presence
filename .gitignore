@@ -17,3 +17,5 @@ config/*_backup.json
 config/app_settings.json
 instrucciones_release.txt
 test_steam*
+config/gfn_title_aliases.json
+

@@ -13,7 +13,8 @@ from src.version import VERSION
 from .constants import ASSETS_DIR
 from .widgets import StatusWidgetAction, CustomMenuItemAction, SectionHeaderAction, VersionLabelAction
 from .mixins import (CookieHandlerMixin, ForceGameHandlerMixin, IntegrityHandlerMixin,
-                     NavigationHandlerMixin, UpdaterHandlerMixin, PresenceHandlerMixin)
+                     NavigationHandlerMixin, UpdaterHandlerMixin, PresenceHandlerMixin,
+                     SteamProfileHandlerMixin)
 
 try:
     LANG = get_lang_from_registry()
@@ -30,7 +31,8 @@ class SystemTrayIcon(QSystemTrayIcon,
                      IntegrityHandlerMixin,
                      NavigationHandlerMixin,
                      UpdaterHandlerMixin,
-                     PresenceHandlerMixin):
+                     PresenceHandlerMixin,
+                     SteamProfileHandlerMixin):
                      
     def __init__(self, presence_manager, texts, config_manager, updater=None, parent=None):
         QSystemTrayIcon.__init__(self, parent)
@@ -315,6 +317,16 @@ class SystemTrayIcon(QSystemTrayIcon,
         self.opt_show_lobby.setCheckable(True)
         self.opt_show_lobby.setChecked(self.config_manager.get_setting("show_lobby_status", True))
         self.opt_show_lobby.triggered.connect(lambda checked: self.config_manager.set_setting("show_lobby_status", checked))
+
+        # 6. Prefer Steam profile status over the GFN window title
+        self.opt_prefer_steam = startup_menu.addAction(TEXTS.get("config_prefer_steam", "Use Steam status to detect the game"))
+        self.opt_prefer_steam.setCheckable(True)
+        self.opt_prefer_steam.setChecked(self.config_manager.get_setting("prefer_steam_status", False))
+        self.opt_prefer_steam.triggered.connect(lambda checked: self.config_manager.set_setting("prefer_steam_status", checked))
+
+        # 7. Steam profile used for the option above and as fallback
+        self.opt_steam_profile = startup_menu.addAction(TEXTS.get("config_steam_profile", "Set Steam profile..."))
+        self.opt_steam_profile.triggered.connect(self.configure_steam_profile)
         
         self.menu.addMenu(startup_menu)
         

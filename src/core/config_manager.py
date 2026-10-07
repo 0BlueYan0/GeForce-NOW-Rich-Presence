@@ -25,7 +25,10 @@ class ConfigManager:
             "start_gfn_on_launch": True,
             "start_discord_on_launch": False,
             "get_cookie_on_launch": False,
-            "show_lobby_status": True
+            "show_lobby_status": True,
+            "steam_profile": "",
+            "steam_id64": "",
+            "prefer_steam_status": False
         }
         self.app_settings_path = USER_DATA_DIR / "app_settings.json"
         self._load()

@@ -21,8 +21,9 @@ from src.core.app_launcher import AppLauncher
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 
 from pypresence import Presence
-from src.core.utils import safe_json_load, save_json, CONFIG_DIR, BASE_DIR, DISCORD_CACHE_PATH, DISCORD_DETECTABLE_URL, DISCORD_CACHE_TTL, DISCORD_AUTO_APPLY_THRESHOLD, DISCORD_ASK_TIMEOUT, IS_WINDOWS, IS_MACOS, IS_LINUX, validate_discord_cache, download_from_github
-from src.core.steam_scraper import SteamScraper, find_steam_appid_by_name
+from src.core.utils import safe_json_load, save_json, CONFIG_DIR, BASE_DIR, DISCORD_CACHE_PATH, DISCORD_DETECTABLE_URL, DISCORD_CACHE_TTL, DISCORD_AUTO_APPLY_THRESHOLD, DISCORD_ASK_TIMEOUT, GFN_ALIAS_CACHE_PATH, IS_WINDOWS, IS_MACOS, IS_LINUX, validate_discord_cache, download_from_github
+from src.core.steam_scraper import SteamScraper, find_steam_appid_by_name, get_steam_now_playing, resolve_english_name_via_steam
+from src.core.gfn_title import STEAM_LANG_BY_LOCALE, is_junk_game_name, parse_gfn_window_title
 from src.core.cookie_manager import CookieManager
 
 # Import win32 libs inside methods or here if safe
@@ -105,6 +106,8 @@ class PresenceManager(QObject):
         # Cache for normalized apps list
         self._cached_apps_normalized = None
         self._last_apps_ts = 0
+        # Localised window-title name -> English name; loaded lazily from disk.
+        self._gfn_aliases = None
 
         # Connection status tracking
         self.is_online = True
@@ -1285,6 +1288,155 @@ class PresenceManager(QObject):
             logger.debug("🧹close_fake_executable desde check_presence exception handler")
             self.close_fake_executable()
 
+    def _match_known_game(self, clean: str) -> Optional[dict]:
+        """Look a parsed title up in the games map, backfilling what's missing.
+
+        Returns the game entry, or None when the name is not in the config.
+        """
+        if not clean:
+            return None
+        for game_name, info in self.games_map.items():
+            if clean.lower() != game_name.lower():
+                continue
+            if not info.get("steam_appid"):
+                appid = find_steam_appid_by_name(game_name)
+                if appid:
+                    info["steam_appid"] = appid
+                    config_path = CONFIG_DIR / "games_config_merged.json"
+                    games_config = safe_json_load(config_path) or {}
+                    games_config.setdefault(game_name, {})
+                    games_config[game_name]["steam_appid"] = appid
+                    save_json(games_config, config_path)
+                    logger.info(f"✅ Steam AppID actualizado en JSON para: {game_name} -> {appid}")
+                    self.games_map = games_config
+
+            # Check if missing client_id
+            if not info.get("client_id"):
+                try:
+                    threading.Thread(
+                        target=self._ensure_discord_match,
+                        args=(game_name,),
+                        daemon=True
+                    ).start()
+                except Exception as e:
+                    logger.debug(f"no se pudo iniciar hilo de discord-match (update): {e}")
+
+            # Asegurar que el nombre está en el objeto devuelto
+            info["name"] = game_name
+            return info
+        return None
+
+    def _resolve_localized_name(self, clean: str, gfn_locale: Optional[str]) -> Optional[str]:
+        """Translate a localised game name into its canonical English name.
+
+        Results (including failures) are cached to config/gfn_title_aliases.json,
+        so the Steam round-trip happens once per game rather than on every tick.
+        Returns None when no translation is available or needed.
+        """
+        steam_lang = STEAM_LANG_BY_LOCALE.get(gfn_locale or "")
+        if not clean or not steam_lang:
+            return None
+        # Latin-script names are already canonical in every locale GFN ships.
+        if clean.isascii():
+            return None
+
+        if getattr(self, "_gfn_aliases", None) is None:
+            self._gfn_aliases = safe_json_load(GFN_ALIAS_CACHE_PATH) or {}
+        cached = self._gfn_aliases.get(clean)
+        if cached is not None:
+            return cached or None
+
+        # A miss costs two HTTP calls; don't retry a failing name every tick.
+        attempt_key = f"gfn-alias::{clean}"
+        now = time.time()
+        if now - self._last_match_attempt.get(attempt_key, 0) < self.MATCH_ATTEMPT_COOLDOWN:
+            return None
+        self._last_match_attempt[attempt_key] = now
+
+        if not getattr(self, "is_online", True):
+            logger.debug("Traducción de título omitida: Modo offline activo.")
+            return None
+
+        resolved = resolve_english_name_via_steam(clean, steam_lang)
+        english = resolved[0] if resolved else ""
+        # Cache the failure as "" too, so an untranslatable name stops retrying.
+        self._gfn_aliases[clean] = english
+        try:
+            save_json(self._gfn_aliases, GFN_ALIAS_CACHE_PATH)
+        except Exception as e:
+            logger.debug(f"no se pudo guardar la caché de alias de títulos: {e}")
+        if english:
+            logger.info(f"🌏 Título localizado traducido: {clean} -> {english}")
+        return english or None
+
+    STEAM_STATUS_CACHE_SECONDS = 30
+
+    def _detect_via_steam(self) -> Optional[dict]:
+        """Ask the user's public Steam profile which game it is in.
+
+        Used when the GFN window title can't identify the game, or always when
+        prefer_steam_status is on. Needs no Web API key, only a public profile.
+        """
+        if not self.config_manager:
+            return None
+        steam_id64 = self.config_manager.get_setting("steam_id64", "")
+        if not steam_id64 or not getattr(self, "is_online", True):
+            return None
+
+        now = time.time()
+        cached_at, cached = getattr(self, "_steam_status_cache", (0, None))
+        if now - cached_at < self.STEAM_STATUS_CACHE_SECONDS:
+            playing = cached
+        else:
+            try:
+                playing = get_steam_now_playing(steam_id64)
+            except Exception as e:
+                logger.debug(f"No se pudo leer el estado de Steam: {e}")
+                playing = None
+            self._steam_status_cache = (now, playing)
+            if playing:
+                self.log_once(f"🟢 Estado de Steam: {playing['name']} (AppID: {playing.get('steam_appid')})")
+
+        if not playing:
+            return None
+        matched = self._match_known_game(playing["name"])
+        if matched:
+            return matched
+        appid = playing.get("steam_appid")
+        if appid:
+            for game_name, info in self.games_map.items():
+                if str(info.get("steam_appid") or "") == appid:
+                    info["name"] = game_name
+                    return info
+        return self._register_new_game(playing["name"], appid)
+
+    def _register_new_game(self, clean: str, appid: Optional[str]) -> dict:
+        new_game = {
+            "name": clean,
+            "steam_appid": appid,
+            "image": "steam"
+        }
+        self.games_map[clean] = new_game
+        config_path = CONFIG_DIR / "games_config_merged.json"
+        games_config = safe_json_load(config_path) or {}
+        games_config[clean] = new_game
+        save_json(games_config, config_path)
+        updated = self.games_map.get(clean)
+        if updated:
+            new_game = updated
+        logger.info(f"🆕 Juego agregado a config: {clean} (AppID: {appid})")
+        self.games_map = games_config
+
+        try:
+            threading.Thread(
+                target=self._ensure_discord_match,
+                args=(clean,),
+                daemon=True
+            ).start()
+        except Exception as e:
+            logger.debug(f"no se pudo iniciar hilo de discord-match: {e}")
+        return new_game
+
     def find_active_game(self) -> Optional[dict]:
         try:
             title = None
@@ -1414,70 +1566,57 @@ class PresenceManager(QObject):
                     self.gfn_error_detected.emit()
                 return None
 
-            clean = re.sub(r'\s*(en|on|in|via)?\s*GeForce\s*NOW.*$', '', title, flags=re.IGNORECASE).strip()
-            clean = re.sub(r'[®™]', '', clean).strip()
-            
+            if self.config_manager and self.config_manager.get_setting("prefer_steam_status", False):
+                from_steam = self._detect_via_steam()
+                if from_steam:
+                    return from_steam
+
+            # The window title layout depends on the GFN client's language: most
+            # locales render "<game> on GeForce NOW", but zh-TW/zh-CN/ja/ko/tr put
+            # the brand first, so slicing at "GeForce NOW" dropped the game name.
+            clean, gfn_locale = parse_gfn_window_title(title)
+
             last_clean = getattr(self, "_last_clean_title", None)
             if clean != last_clean:
                 setattr(self, "_last_clean_title", clean)
             if not clean:
                 return None
 
-            appid = None 
-            for game_name, info in self.games_map.items():
-                if clean.lower() == game_name.lower():
-                    if not info.get("steam_appid"):
-                        appid = find_steam_appid_by_name(clean)
-                        if appid:
-                            info["steam_appid"] = appid
-                            config_path = CONFIG_DIR / "games_config_merged.json"
-                            games_config = safe_json_load(config_path) or {}
-                            games_config.setdefault(game_name, {})
-                            games_config[game_name]["steam_appid"] = appid
-                            save_json(games_config, config_path)
-                            logger.info(f"✅ Steam AppID actualizado en JSON para: {game_name} -> {appid}")
-                            self.games_map = games_config
-                    
-                    # Check if missing client_id
-                    if not info.get("client_id"):
-                        try:
-                            threading.Thread(
-                                target=self._ensure_discord_match,
-                                args=(clean,),
-                                daemon=True
-                            ).start()
-                        except Exception as e:
-                            logger.debug(f"no se pudo iniciar hilo de discord-match (update): {e}")
+            matched = self._match_known_game(clean)
+            if matched:
+                return matched
 
-                    # Asegurar que el nombre está en el objeto devuelto
-                    info["name"] = game_name
-                    return info
-            appid = find_steam_appid_by_name(clean)
-            new_game = {
-                "name": clean,
-                "steam_appid": appid,
-                "image": "steam"
-            }
-            self.games_map[clean] = new_game
-            config_path = CONFIG_DIR / "games_config_merged.json"
-            games_config = safe_json_load(config_path) or {}
-            games_config[clean] = new_game
-            save_json(games_config, config_path)
-            updated = self.games_map.get(clean)
-            if updated:
-                new_game = updated
-            logger.info(f"🆕 Juego agregado a config: {clean} (AppID: {appid})")
-            self.games_map = games_config
+            # GFN localises game names as well as its own UI, so a zh-TW client
+            # reports "光與影：33號遠征隊" for a game the config knows as
+            # "Clair Obscur: Expedition 33". Translate before giving up.
+            english = self._resolve_localized_name(clean, gfn_locale)
+            if english:
+                matched = self._match_known_game(english)
+                if matched:
+                    return matched
+                clean = english
 
-            try:
-                threading.Thread(
-                    target=self._ensure_discord_match,
-                    args=(clean,),
-                    daemon=True
-                ).start()
-            except Exception as e:
-                logger.debug(f"no se pudo iniciar hilo de discord-match: {e}")
-            return new_game
+            if is_junk_game_name(clean):
+                from_steam = self._detect_via_steam()
+                if from_steam:
+                    return from_steam
+                self.log_once(f"⚠️ Título de ventana no reconocido, se ignora: {title!r}", "warning")
+                return None
+
+            # When the Steam profile answers instead, the title never gets
+            # registered, so without this the appid search would repeat every tick.
+            miss_key = f"appid-miss::{clean}"
+            if time.time() - self._last_match_attempt.get(miss_key, 0) < self.MATCH_ATTEMPT_COOLDOWN:
+                appid = None
+            else:
+                appid = find_steam_appid_by_name(clean)
+                if not appid:
+                    self._last_match_attempt[miss_key] = time.time()
+            if not appid:
+                from_steam = self._detect_via_steam()
+                if from_steam:
+                    return from_steam
+            return self._register_new_game(clean, appid)
 
         except Exception as e:
             if str(e) == "cannot access local variable 'title' where it is not associated with a value":

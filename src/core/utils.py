@@ -40,6 +40,8 @@ ASSETS_DIR = resource_path("assets")
 LOG_FILE = LOGS_DIR / "geforce_presence.log"
 ENV_PATH = resource_path(".env")
 DISCORD_CACHE_PATH = CONFIG_DIR / "discord_apps_cache.json"
+# Localised GFN window-title name -> canonical English game name.
+GFN_ALIAS_CACHE_PATH = CONFIG_DIR / "gfn_title_aliases.json"
 DISCORD_DETECTABLE_URL = "https://discord.com/api/v10/applications/detectable"
 DISCORD_CACHE_TTL = 60 * 60 * 24  # 1 day
 DISCORD_AUTO_APPLY_THRESHOLD = 0.85

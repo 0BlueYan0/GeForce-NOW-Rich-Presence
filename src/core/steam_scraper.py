@@ -1,7 +1,9 @@
 import requests
 import logging
 import re
+from html import unescape
 from typing import Optional, Tuple
+from urllib.parse import quote
 
 try:
     from bs4 import BeautifulSoup
@@ -181,7 +183,7 @@ class SteamScraper:
             
 def find_steam_appid_by_name(game_name: str) -> Optional[str]:
     try:
-        url = f"https://steamcommunity.com/actions/SearchApps/{game_name}"
+        url = f"https://steamcommunity.com/actions/SearchApps/{quote(game_name)}"
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
@@ -193,4 +195,141 @@ def find_steam_appid_by_name(game_name: str) -> Optional[str]:
                     return str(data[0].get("appid"))
     except Exception as e:
         logger.error(f"Error buscando Steam AppID: {e}")
+    return None
+
+
+STEAM_ID64_BASE = 76561197960265728
+_BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+
+def resolve_steam_id64(profile: str) -> Optional[str]:
+    """Turn a profile URL, custom URL name or SteamID64 into a SteamID64.
+
+    The public ``?xml=1`` profile page answers without a Web API key, which is
+    what lets users without a key point the app at their own account.
+    """
+    text = (profile or "").strip().rstrip("/")
+    if not text:
+        return None
+    m = re.search(r'steamcommunity\.com/(id|profiles)/([^/?#]+)', text)
+    if m:
+        kind, value = m.group(1), m.group(2)
+    else:
+        kind, value = ("profiles" if re.fullmatch(r'\d{17}', text) else "id"), text
+    if kind == "profiles" and re.fullmatch(r'\d{17}', value):
+        return value
+    try:
+        resp = requests.get(f"https://steamcommunity.com/id/{quote(value)}/?xml=1",
+                            headers=_BROWSER_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return None
+        m_id = re.search(r'<steamID64>(\d{17})</steamID64>', resp.text)
+        return m_id.group(1) if m_id else None
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        raise
+    except Exception as e:
+        logger.debug(f"Error resolviendo SteamID64 de '{profile}': {e}")
+    return None
+
+
+def parse_miniprofile_game(html: str) -> Optional[dict]:
+    """Read the in-game app from a steamcommunity.com miniprofile.
+
+    The miniprofile is used instead of the ``?xml=1`` page because the XML only
+    carries the game name, while the miniprofile's capsule image URL also holds
+    the appid.
+    """
+    if not html or "miniprofile_gamesection" not in html:
+        return None
+    m_name = re.search(r'class="miniprofile_game_name"[^>]*>([^<]+)<', html)
+    if not m_name:
+        return None
+    name = unescape(m_name.group(1)).strip()
+    if not name:
+        return None
+    m_app = re.search(r'class="game_logo"[^>]*src="[^"]*/apps/(\d+)/', html)
+    return {"name": name, "steam_appid": m_app.group(1) if m_app else None}
+
+
+def get_steam_now_playing(steam_id64: str) -> Optional[dict]:
+    """Return ``{"name", "steam_appid"}`` for the game the account is in, else None.
+
+    Only works when the profile and its game details are public.
+    """
+    try:
+        account_id = int(steam_id64) - STEAM_ID64_BASE
+    except (TypeError, ValueError):
+        return None
+    if account_id <= 0:
+        return None
+    try:
+        resp = requests.get(f"https://steamcommunity.com/miniprofile/{account_id}",
+                            headers=_BROWSER_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return None
+        return parse_miniprofile_game(resp.text)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        raise
+    except Exception as e:
+        logger.debug(f"Error leyendo el estado de Steam de {steam_id64}: {e}")
+    return None
+
+
+def resolve_english_name_via_steam(localized_name: str, steam_lang: str,
+                                   country: str = "US") -> Optional[Tuple[str, str]]:
+    """Map a localised game name back to its English name via the Steam store.
+
+    The GeForce NOW client localises game titles, not just its own UI: a zh-TW
+    client reports "光與影：33號遠征隊", while games_config_merged.json is keyed on
+    "Clair Obscur: Expedition 33".  Searching the store in the same language the
+    title came in, then reading the app back in English, bridges the two.
+
+    Note this deliberately uses store.steampowered.com rather than the
+    steamcommunity.com endpoint above -- the latter returns an empty list for
+    non-Latin queries.
+
+    Returns ``(english_name, steam_appid)``, or ``None`` if nothing matched.
+    """
+    if not localized_name or not steam_lang:
+        return None
+    try:
+        resp = requests.get(
+            "https://store.steampowered.com/api/storesearch/",
+            params={"term": localized_name, "cc": country, "l": steam_lang},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        items = (resp.json() or {}).get("items") or []
+        if not items:
+            return None
+
+        # Prefer an exact hit on the localised name; the store also returns
+        # soundtracks and deluxe editions, which sort alongside the base game.
+        appid = None
+        for item in items:
+            if str(item.get("name", "")).strip().lower() == localized_name.strip().lower():
+                appid = item.get("id")
+                break
+        if appid is None:
+            appid = items[0].get("id")
+        if appid is None:
+            return None
+
+        detail = requests.get(
+            "https://store.steampowered.com/api/appdetails",
+            params={"appids": appid, "l": "english"},
+            timeout=10,
+        )
+        if detail.status_code != 200:
+            return None
+        english = ((detail.json() or {}).get(str(appid)) or {}).get("data", {}).get("name")
+        if not english:
+            return None
+        return str(english).strip(), str(appid)
+    except Exception as e:
+        logger.debug(f"Error resolviendo nombre localizado '{localized_name}' via Steam: {e}")
     return None

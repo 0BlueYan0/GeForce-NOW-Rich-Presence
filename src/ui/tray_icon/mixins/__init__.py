@@ -4,6 +4,7 @@ from .integrity_handler import IntegrityHandlerMixin
 from .navigation_handler import NavigationHandlerMixin
 from .updater_handler import UpdaterHandlerMixin
 from .presence_handler import PresenceHandlerMixin
+from .steam_profile_handler import SteamProfileHandlerMixin
 
 __all__ = [
     'CookieHandlerMixin',
@@ -11,5 +12,6 @@ __all__ = [
     'IntegrityHandlerMixin',
     'NavigationHandlerMixin',
     'UpdaterHandlerMixin',
-    'PresenceHandlerMixin'
+    'PresenceHandlerMixin',
+    'SteamProfileHandlerMixin'
 ]
