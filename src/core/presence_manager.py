@@ -22,7 +22,7 @@ from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 
 from pypresence import Presence
 from src.core.utils import safe_json_load, save_json, CONFIG_DIR, BASE_DIR, DISCORD_CACHE_PATH, DISCORD_DETECTABLE_URL, DISCORD_CACHE_TTL, DISCORD_AUTO_APPLY_THRESHOLD, DISCORD_ASK_TIMEOUT, GFN_ALIAS_CACHE_PATH, IS_WINDOWS, IS_MACOS, IS_LINUX, validate_discord_cache, download_from_github
-from src.core.steam_scraper import SteamScraper, find_steam_appid_by_name, get_steam_now_playing, resolve_english_name_via_steam
+from src.core.steam_scraper import SteamScraper, find_steam_appid_by_name, get_steam_now_playing, resolve_english_name_via_steam, SteamStatusUnavailable
 from src.core.gfn_title import STEAM_LANG_BY_LOCALE, is_junk_game_name, parse_gfn_window_title
 from src.core.cookie_manager import CookieManager
 
@@ -1370,6 +1370,7 @@ class PresenceManager(QObject):
         return english or None
 
     STEAM_STATUS_CACHE_SECONDS = 30
+    STEAM_RATE_LIMIT_BACKOFF_SECONDS = 300
 
     def _detect_via_steam(self) -> Optional[dict]:
         """Ask the user's public Steam profile which game it is in.
@@ -1385,15 +1386,23 @@ class PresenceManager(QObject):
 
         now = time.time()
         cached_at, cached = getattr(self, "_steam_status_cache", (0, None))
-        if now - cached_at < self.STEAM_STATUS_CACHE_SECONDS:
+        if now < cached_at + self.STEAM_STATUS_CACHE_SECONDS:
             playing = cached
         else:
             try:
                 playing = get_steam_now_playing(steam_id64)
+                self._steam_status_cache = (now, playing)
             except Exception as e:
-                logger.debug(f"No se pudo leer el estado de Steam: {e}")
-                playing = None
-            self._steam_status_cache = (now, playing)
+                # A failed read is not "stopped playing": keep the last answer so
+                # the Discord status doesn't drop to the GFN title and back.
+                playing = cached
+                retry_at = now
+                if isinstance(e, SteamStatusUnavailable) and e.rate_limited:
+                    retry_at = now + self.STEAM_RATE_LIMIT_BACKOFF_SECONDS - self.STEAM_STATUS_CACHE_SECONDS
+                    self.log_once("⏳ Steam limitó las consultas (429); se reintenta en 5 minutos.", "warning")
+                else:
+                    logger.debug(f"No se pudo leer el estado de Steam: {e}")
+                self._steam_status_cache = (retry_at, cached)
             if playing:
                 self.log_once(f"🟢 Estado de Steam: {playing['name']} (AppID: {playing.get('steam_appid')})")
 
@@ -1402,7 +1411,16 @@ class PresenceManager(QObject):
         matched = self._match_known_game(playing["name"])
         if matched:
             return matched
+        # The profile page only gives the name, so the appid comes from a search,
+        # remembered per name to keep it to one search per game.
         appid = playing.get("steam_appid")
+        if not appid:
+            known = getattr(self, "_steam_name_appids", None)
+            if known is None:
+                known = self._steam_name_appids = {}
+            if playing["name"] not in known:
+                known[playing["name"]] = find_steam_appid_by_name(playing["name"])
+            appid = known[playing["name"]]
         if appid:
             for game_name, info in self.games_map.items():
                 if str(info.get("steam_appid") or "") == appid:

@@ -235,47 +235,58 @@ def resolve_steam_id64(profile: str) -> Optional[str]:
     return None
 
 
-def parse_miniprofile_game(html: str) -> Optional[dict]:
-    """Read the in-game app from a steamcommunity.com miniprofile.
+def parse_profile_in_game(html: str) -> Optional[str]:
+    """Read the "Currently In-Game" game name from a steamcommunity.com profile page.
 
-    The miniprofile is used instead of the ``?xml=1`` page because the XML only
-    carries the game name, while the miniprofile's capsule image URL also holds
-    the appid.
+    The full profile page is used rather than /miniprofile/<accountid>: on
+    2026-10-07 the miniprofile kept reporting "Online" for minutes while the
+    profile page showed the game, and the ?xml=1 page is served with
+    max-age=3600, so it can be an hour stale.
     """
-    if not html or "miniprofile_gamesection" not in html:
+    if not html:
         return None
-    m_name = re.search(r'class="miniprofile_game_name"[^>]*>([^<]+)<', html)
-    if not m_name:
+    m = re.search(
+        r'<div class="profile_in_game persona in-game">.*?'
+        r'<div class="profile_in_game_name">([^<]*)</div>',
+        html, re.DOTALL)
+    if not m:
         return None
-    name = unescape(m_name.group(1)).strip()
-    if not name:
-        return None
-    m_app = re.search(r'class="game_logo"[^>]*src="[^"]*/apps/(\d+)/', html)
-    return {"name": name, "steam_appid": m_app.group(1) if m_app else None}
+    name = unescape(m.group(1)).strip()
+    return name or None
+
+
+class SteamStatusUnavailable(Exception):
+    """The profile page could not be read, as opposed to "not in a game"."""
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP {status_code}")
+        self.rate_limited = status_code == 429
+
+
+# /profiles/<id64>/ redirects to /id/<custom url>/ for accounts with a custom
+# URL; remembering the target halves the requests counted against the limit.
+_profile_urls: dict = {}
 
 
 def get_steam_now_playing(steam_id64: str) -> Optional[dict]:
     """Return ``{"name", "steam_appid"}`` for the game the account is in, else None.
 
-    Only works when the profile and its game details are public.
+    The profile page carries no appid, so ``steam_appid`` is always None here;
+    callers resolve it from the name. Only works when the profile and its game
+    details are public. Raises SteamStatusUnavailable when Steam answers with
+    an error page (429 included) instead of the profile.
     """
-    try:
-        account_id = int(steam_id64) - STEAM_ID64_BASE
-    except (TypeError, ValueError):
+    if not re.fullmatch(r'\d{17}', str(steam_id64 or "")):
         return None
-    if account_id <= 0:
+    if int(steam_id64) <= STEAM_ID64_BASE:
         return None
-    try:
-        resp = requests.get(f"https://steamcommunity.com/miniprofile/{account_id}",
-                            headers=_BROWSER_HEADERS, timeout=10)
-        if resp.status_code != 200:
-            return None
-        return parse_miniprofile_game(resp.text)
-    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        raise
-    except Exception as e:
-        logger.debug(f"Error leyendo el estado de Steam de {steam_id64}: {e}")
-    return None
+    url = _profile_urls.get(steam_id64, f"https://steamcommunity.com/profiles/{steam_id64}/")
+    resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=10)
+    if resp.status_code != 200:
+        raise SteamStatusUnavailable(resp.status_code)
+    if resp.history:
+        _profile_urls[steam_id64] = resp.url
+    name = parse_profile_in_game(resp.text)
+    return {"name": name, "steam_appid": None} if name else None
 
 
 def resolve_english_name_via_steam(localized_name: str, steam_lang: str,
