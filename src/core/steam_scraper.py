@@ -1,6 +1,7 @@
 import requests
 import logging
 import re
+import time
 from html import unescape
 from typing import Optional, Tuple
 from urllib.parse import quote
@@ -266,6 +267,25 @@ class SteamStatusUnavailable(Exception):
 # URL; remembering the target halves the requests counted against the limit.
 _profile_urls: dict = {}
 
+# On 2026-10-07 the profile page answered 429 for over 50 minutes while the
+# ?xml=1 page still answered 200, so a 429 switches to the XML for a while.
+# The XML is served with max-age=3600 and was seen still reporting a game
+# minutes after it closed, which is why it is the fallback and not the source.
+PROFILE_PAGE_BACKOFF_SECONDS = 600
+_profile_page_blocked_until = 0.0
+
+
+def parse_profile_xml_in_game(xml: str) -> Optional[str]:
+    """Read the game name from a ``?xml=1`` profile, e.g.
+    ``<stateMessage><![CDATA[In-Game<br/>FINAL FANTASY VII]]></stateMessage>``."""
+    if not xml or "<onlineState>in-game</onlineState>" not in xml:
+        return None
+    m = re.search(r'<stateMessage><!\[CDATA\[[^<]*<br\s*/?>(.*?)\]\]></stateMessage>', xml, re.DOTALL)
+    if not m:
+        return None
+    name = unescape(m.group(1)).strip()
+    return name or None
+
 
 def get_steam_now_playing(steam_id64: str) -> Optional[dict]:
     """Return ``{"name", "steam_appid"}`` for the game the account is in, else None.
@@ -279,13 +299,25 @@ def get_steam_now_playing(steam_id64: str) -> Optional[dict]:
         return None
     if int(steam_id64) <= STEAM_ID64_BASE:
         return None
-    url = _profile_urls.get(steam_id64, f"https://steamcommunity.com/profiles/{steam_id64}/")
-    resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=10)
+    global _profile_page_blocked_until
+    if time.time() >= _profile_page_blocked_until:
+        url = _profile_urls.get(steam_id64, f"https://steamcommunity.com/profiles/{steam_id64}/")
+        resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=10)
+        if resp.status_code == 200:
+            if resp.history:
+                _profile_urls[steam_id64] = resp.url
+            name = parse_profile_in_game(resp.text)
+            return {"name": name, "steam_appid": None} if name else None
+        if resp.status_code != 429:
+            raise SteamStatusUnavailable(resp.status_code)
+        _profile_page_blocked_until = time.time() + PROFILE_PAGE_BACKOFF_SECONDS
+        logger.info("⏳ Página de perfil de Steam limitada (429); se usa el perfil XML.")
+
+    resp = requests.get(f"https://steamcommunity.com/profiles/{steam_id64}/?xml=1",
+                        headers=_BROWSER_HEADERS, timeout=10)
     if resp.status_code != 200:
         raise SteamStatusUnavailable(resp.status_code)
-    if resp.history:
-        _profile_urls[steam_id64] = resp.url
-    name = parse_profile_in_game(resp.text)
+    name = parse_profile_xml_in_game(resp.text)
     return {"name": name, "steam_appid": None} if name else None
 
 

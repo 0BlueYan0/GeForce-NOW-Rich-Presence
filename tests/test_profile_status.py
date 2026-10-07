@@ -1,10 +1,13 @@
 import unittest
 from unittest.mock import patch, MagicMock
 
+import src.core.steam_scraper as steam_scraper
+
 from src.core.steam_scraper import (
     get_steam_now_playing,
     SteamStatusUnavailable,
     parse_profile_in_game,
+    parse_profile_xml_in_game,
     resolve_steam_id64,
 )
 
@@ -19,6 +22,12 @@ ONLINE_HTML = (
     '<div class="profile_in_game persona online">\n\t<div class="profile_in_game_header">Currently Online</div>\n</div>'
     '<div class="profile_in_game_name">Should not be read</div>'
 )
+# stateMessage lines as served by the live ?xml=1 page (2026-10-07).
+IN_GAME_XML = (
+    '<profile><onlineState>in-game</onlineState>'
+    '<stateMessage><![CDATA[In-Game<br/>FINAL FANTASY VII REMAKE INTERGRADE]]></stateMessage></profile>'
+)
+ONLINE_XML = '<profile><onlineState>online</onlineState><stateMessage><![CDATA[Online]]></stateMessage></profile>'
 PROFILE_XML = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><profile>\n'
     '\t<steamID64>76561198308179097</steamID64>\n\t<onlineState>in-game</onlineState>\n</profile>'
@@ -48,7 +57,18 @@ class ParseProfileInGameTests(unittest.TestCase):
         self.assertEqual(parse_profile_in_game(html), "Tom Clancy's The Division")
 
 
+class ParseProfileXmlTests(unittest.TestCase):
+    def test_in_game(self):
+        self.assertEqual(parse_profile_xml_in_game(IN_GAME_XML), "FINAL FANTASY VII REMAKE INTERGRADE")
+
+    def test_online(self):
+        self.assertIsNone(parse_profile_xml_in_game(ONLINE_XML))
+
+
 class GetSteamNowPlayingTests(unittest.TestCase):
+    def setUp(self):
+        steam_scraper._profile_page_blocked_until = 0.0
+        steam_scraper._profile_urls.clear()
     @patch("src.core.steam_scraper.requests.get")
     def test_reads_profile_page(self, mock_get):
         mock_get.return_value = _resp(IN_GAME_HTML)
@@ -67,6 +87,21 @@ class GetSteamNowPlayingTests(unittest.TestCase):
         with self.assertRaises(SteamStatusUnavailable) as ctx:
             get_steam_now_playing("76561198308179097")
         self.assertTrue(ctx.exception.rate_limited)
+
+    @patch("src.core.steam_scraper.requests.get")
+    def test_profile_429_falls_back_to_xml(self, mock_get):
+        mock_get.side_effect = [_resp("error", status=429), _resp(IN_GAME_XML)]
+        result = get_steam_now_playing("76561198308179097")
+        self.assertEqual(result["name"], "FINAL FANTASY VII REMAKE INTERGRADE")
+        self.assertIn("?xml=1", mock_get.call_args[0][0])
+
+    @patch("src.core.steam_scraper.requests.get")
+    def test_after_429_skips_profile_page(self, mock_get):
+        mock_get.side_effect = [_resp("error", status=429), _resp(IN_GAME_XML), _resp(IN_GAME_XML)]
+        get_steam_now_playing("76561198308179097")
+        get_steam_now_playing("76561198308179097")
+        self.assertEqual(mock_get.call_count, 3)
+        self.assertIn("?xml=1", mock_get.call_args_list[2][0][0])
 
     @patch.dict("src.core.steam_scraper._profile_urls", clear=True)
     @patch("src.core.steam_scraper.requests.get")
